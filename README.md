@@ -1,0 +1,42 @@
+# Fancia
+
+Fancia is a social platform connecting people with shared interests for offline, in-person group gatherings and community building.
+
+## infra-pipeline
+
+This repository contains Terraform code to provision an AWS-based CI/CD pipeline for managing infrastructure and Helm deployments for the project [fancia-infra](https://github.com/fungkinchun/fancia-infra)
+
+### Prerequisites
+
+- AWS CLI installed and configured for the target account and profile
+- Terraform installed
+
+### Quick start (local deployment)
+
+1. Define the profile and project name to be used for deployment:
+
+   ```bash
+   export AWS_PROFILE=<your-aws-profile>
+   export PROJECT_NAME=<your-project-name>
+   ```
+
+2. Initialize Terraform state (adjust backend bucket name as needed):
+
+   ```bash
+   terraform init -backend-config="bucket=${PROJECT_NAME}-infra-pipeline-terraform-state"
+   ```
+
+3. Plan and apply the infrastructure:
+
+   ```bash
+   terraform plan
+   terraform apply
+   ```
+
+### Notes
+
+- This pipeline passes values to [fancia-infra](https://github.com/fungkinchun/fancia-infra), which includes credentials for services such as [fancia-user](https://github.com/fungkinchun/fancia-backend-user).
+- Update variables in `terraform.tfvars` (project_name, region, profile, GitHub connection details, and infra_credentials) before applying. Create a local `terraform.tfvars` file if it does not exist and ensure it is not checked into version control.
+- Ensure buildspec files referenced by CodeBuild projects (`buildspec_plan.yaml`, `buildspec_apply.yaml`, `buildspec_destroy.yaml`) are present in the infra repository, and ArgoCD buildspecs (`buildspec_argocd_bootstrap.yaml`, `buildspec_argocd_uninstall.yaml`) are present in the helm repository.
+- When updating `infra_credentials`, update the corresponding type definitions in `variables.tf`.
+- The pipeline streamlines the creation of new services and shared libraries. Simply update the `infra_credentials` in `terraform.tfvars`, and the infrastructure for the new service or shared library will be automatically provisioned.

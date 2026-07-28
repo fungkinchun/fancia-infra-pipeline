@@ -1,0 +1,824 @@
+provider "aws" {
+  region  = var.region
+  profile = var.profile
+}
+
+data "aws_caller_identity" "current" {}
+
+locals {
+  full_project_name            = "${var.project_name}-infra"
+  serverless_full_project_name = "${var.project_name}-serverless-infra"
+}
+
+data "aws_iam_policy_document" "codebuild_assume_role_policy" {
+  statement {
+    effect  = "Allow"
+    actions = ["sts:AssumeRole"]
+    principals {
+      type = "Service"
+      identifiers = [
+        "codebuild.amazonaws.com",
+        "codeartifact.amazonaws.com",
+        "codepipeline.amazonaws.com",
+        "codestar.amazonaws.com"
+      ]
+    }
+  }
+}
+
+data "aws_iam_policy_document" "codebuild_policy" {
+  statement {
+    effect    = "Allow"
+    actions   = ["*"]
+    resources = ["*"]
+  }
+}
+# Create S3 bucket for infra-pipeline Terraform state
+resource "aws_s3_bucket" "pipeline_terraform_state" {
+  bucket = "${local.full_project_name}-pipeline-terraform-state"
+
+  lifecycle {
+    prevent_destroy = true
+  }
+}
+
+resource "aws_s3_bucket_versioning" "pipeline_terraform_state_versioning" {
+  bucket = aws_s3_bucket.pipeline_terraform_state.id
+
+  versioning_configuration {
+    status = "Enabled"
+  }
+}
+
+# Create S3 bucket for infra Terraform state
+resource "aws_s3_bucket" "terraform_state" {
+  bucket = "${local.full_project_name}-terraform-state"
+
+  lifecycle {
+    prevent_destroy = true
+  }
+}
+
+resource "aws_s3_bucket_versioning" "terraform_state_versioning" {
+  bucket = aws_s3_bucket.terraform_state.id
+
+  versioning_configuration {
+    status = "Enabled"
+  }
+}
+
+# Create S3 bucket for serverless infra Terraform state
+resource "aws_s3_bucket" "serverless_terraform_state" {
+  bucket = "${local.serverless_full_project_name}-terraform-state"
+
+  lifecycle {
+    prevent_destroy = true
+  }
+}
+
+resource "aws_s3_bucket_versioning" "serverless_terraform_state_versioning" {
+  bucket = aws_s3_bucket.serverless_terraform_state.id
+
+  versioning_configuration {
+    status = "Enabled"
+  }
+}
+
+resource "aws_s3_bucket" "pipeline_artifact" {
+  bucket        = "${local.full_project_name}-pipeline-artifact"
+  force_destroy = true
+}
+
+resource "aws_s3_bucket_versioning" "pipeline_artifact_versioning" {
+  bucket = aws_s3_bucket.pipeline_artifact.id
+
+  versioning_configuration {
+    status = "Enabled"
+  }
+}
+
+resource "aws_codestarconnections_connection" "github" {
+  name          = "github-connection"
+  provider_type = "GitHub"
+}
+
+resource "aws_secretsmanager_secret" "infra_credentials" {
+  name                    = "${var.project_name}-infra"
+  description             = "Credentials for ${var.project_name} infra"
+  recovery_window_in_days = 0
+
+  tags = {
+    Project     = "${var.project_name}-infra"
+    Terraform   = "true"
+    Sensitivity = "high"
+  }
+}
+
+resource "aws_secretsmanager_secret_version" "infra_credentials_version" {
+  secret_id     = aws_secretsmanager_secret.infra_credentials.id
+  secret_string = jsonencode(merge(var.infra_credentials, { _last_apply = timestamp() }))
+}
+
+resource "aws_secretsmanager_secret" "dockerhub_credentials" {
+  name                    = "dockerhub"
+  description             = "DockerHub credentials"
+  recovery_window_in_days = 0
+
+  tags = {
+    Terraform   = "true"
+    Sensitivity = "high"
+  }
+}
+
+resource "aws_secretsmanager_secret_version" "dockerhub_credentials_version" {
+  secret_id     = aws_secretsmanager_secret.dockerhub_credentials.id
+  secret_string = jsonencode(var.dockerhub_credentials)
+}
+
+resource "aws_iam_role" "codebuild_role" {
+  name               = "${local.full_project_name}-codebuild-role"
+  assume_role_policy = data.aws_iam_policy_document.codebuild_assume_role_policy.json
+}
+
+resource "aws_iam_role_policy" "codebuild_policy" {
+  role   = aws_iam_role.codebuild_role.id
+  policy = data.aws_iam_policy_document.codebuild_policy.json
+}
+
+resource "aws_codebuild_project" "codebuild_project_plan" {
+  name         = "${local.full_project_name}-plan"
+  service_role = aws_iam_role.codebuild_role.arn
+
+  artifacts {
+    type = "CODEPIPELINE"
+  }
+
+  environment {
+    compute_type    = "BUILD_GENERAL1_SMALL"
+    image           = "aws/codebuild/standard:5.0"
+    type            = "LINUX_CONTAINER"
+    privileged_mode = false
+
+    environment_variable {
+      name  = "TF_VERSION"
+      value = var.tf_version
+    }
+
+    environment_variable {
+      name  = "PROJECT_NAME"
+      value = var.project_name
+    }
+
+    environment_variable {
+      name  = "AWS_SECRET_NAME"
+      value = aws_secretsmanager_secret.infra_credentials.name
+    }
+  }
+
+  source {
+    type      = "CODEPIPELINE"
+    buildspec = "buildspec_plan.yaml"
+  }
+}
+
+resource "aws_codebuild_project" "codebuild_project_apply" {
+  name         = "${local.full_project_name}-apply"
+  service_role = aws_iam_role.codebuild_role.arn
+
+  artifacts {
+    type = "CODEPIPELINE"
+  }
+
+  environment {
+    compute_type    = "BUILD_GENERAL1_SMALL"
+    image           = "aws/codebuild/standard:5.0"
+    type            = "LINUX_CONTAINER"
+    privileged_mode = false
+
+    environment_variable {
+      name  = "TF_VERSION"
+      value = var.tf_version
+    }
+
+    environment_variable {
+      name  = "PROJECT_NAME"
+      value = var.project_name
+    }
+  }
+
+  source {
+    type      = "CODEPIPELINE"
+    buildspec = "buildspec_apply.yaml"
+  }
+}
+
+resource "aws_codebuild_project" "codebuild_project_destroy" {
+  name         = "${local.full_project_name}-destroy"
+  service_role = aws_iam_role.codebuild_role.arn
+
+  artifacts {
+    type = "CODEPIPELINE"
+  }
+
+  environment {
+    compute_type    = "BUILD_GENERAL1_SMALL"
+    image           = "aws/codebuild/standard:5.0"
+    type            = "LINUX_CONTAINER"
+    privileged_mode = false
+
+    environment_variable {
+      name  = "TF_VERSION"
+      value = var.tf_version
+    }
+
+    environment_variable {
+      name  = "PROJECT_NAME"
+      value = var.project_name
+    }
+
+    environment_variable {
+      name  = "AWS_SECRET_NAME"
+      value = aws_secretsmanager_secret.infra_credentials.name
+    }
+  }
+
+  source {
+    type      = "CODEPIPELINE"
+    buildspec = "buildspec_destroy.yaml"
+  }
+}
+
+resource "aws_codebuild_project" "codebuild_project_serverless_plan" {
+  name         = "${local.serverless_full_project_name}-plan"
+  service_role = aws_iam_role.codebuild_role.arn
+
+  artifacts {
+    type = "CODEPIPELINE"
+  }
+
+  environment {
+    compute_type    = "BUILD_GENERAL1_SMALL"
+    image           = "aws/codebuild/standard:5.0"
+    type            = "LINUX_CONTAINER"
+    privileged_mode = false
+
+    environment_variable {
+      name  = "TF_VERSION"
+      value = var.tf_version
+    }
+
+    environment_variable {
+      name  = "PROJECT_NAME"
+      value = var.project_name
+    }
+
+    environment_variable {
+      name  = "AWS_SECRET_NAME"
+      value = aws_secretsmanager_secret.infra_credentials.name
+    }
+
+    environment_variable {
+      name  = "ENVIRONMENT"
+      value = var.environment
+    }
+    environment_variable {
+      name  = "DOMAIN_NAME"
+      value = var.domain_name
+    }
+  }
+
+  source {
+    type      = "CODEPIPELINE"
+    buildspec = "buildspec_plan.yaml"
+  }
+}
+
+resource "aws_codebuild_project" "codebuild_project_serverless_apply" {
+  name         = "${local.serverless_full_project_name}-apply"
+  service_role = aws_iam_role.codebuild_role.arn
+
+  artifacts {
+    type = "CODEPIPELINE"
+  }
+
+  environment {
+    compute_type    = "BUILD_GENERAL1_SMALL"
+    image           = "aws/codebuild/standard:5.0"
+    type            = "LINUX_CONTAINER"
+    privileged_mode = false
+
+    environment_variable {
+      name  = "TF_VERSION"
+      value = var.tf_version
+    }
+
+    environment_variable {
+      name  = "PROJECT_NAME"
+      value = var.project_name
+    }
+  }
+
+  source {
+    type      = "CODEPIPELINE"
+    buildspec = "buildspec_apply.yaml"
+  }
+}
+
+resource "aws_codebuild_project" "codebuild_project_serverless_destroy" {
+  name         = "${local.serverless_full_project_name}-destroy"
+  service_role = aws_iam_role.codebuild_role.arn
+
+  artifacts {
+    type = "CODEPIPELINE"
+  }
+
+  environment {
+    compute_type    = "BUILD_GENERAL1_SMALL"
+    image           = "aws/codebuild/standard:5.0"
+    type            = "LINUX_CONTAINER"
+    privileged_mode = false
+
+    environment_variable {
+      name  = "TF_VERSION"
+      value = var.tf_version
+    }
+
+    environment_variable {
+      name  = "PROJECT_NAME"
+      value = var.project_name
+    }
+
+    environment_variable {
+      name  = "AWS_SECRET_NAME"
+      value = aws_secretsmanager_secret.infra_credentials.name
+    }
+
+    environment_variable {
+      name  = "ENVIRONMENT"
+      value = var.environment
+    }
+    environment_variable {
+      name  = "DOMAIN_NAME"
+      value = var.domain_name
+    }
+  }
+
+  source {
+    type      = "CODEPIPELINE"
+    buildspec = "buildspec_destroy.yaml"
+  }
+}
+
+resource "aws_codebuild_project" "codebuild_project_argocd_bootstrap" {
+  name         = "${local.full_project_name}-argocd-bootstrap"
+  service_role = aws_iam_role.codebuild_role.arn
+
+  artifacts {
+    type = "CODEPIPELINE"
+  }
+
+  environment {
+    compute_type    = "BUILD_GENERAL1_SMALL"
+    image           = "aws/codebuild/standard:5.0"
+    type            = "LINUX_CONTAINER"
+    privileged_mode = false
+
+    environment_variable {
+      name  = "USE_EKS"
+      value = var.use_eks ? "true" : "false"
+    }
+
+    environment_variable {
+      name  = "EKS_CLUSTER_NAME"
+      value = "${var.project_name}-${var.environment}-eks"
+    }
+
+    environment_variable {
+      name  = "PROJECT_NAME"
+      value = var.project_name
+    }
+
+    environment_variable {
+      name  = "ENVIRONMENT"
+      value = var.environment
+    }
+
+    environment_variable {
+      name  = "AWS_ACCOUNT_ID"
+      value = data.aws_caller_identity.current.account_id
+    }
+
+    environment_variable {
+      name  = "AWS_REGION"
+      value = var.region
+    }
+
+    environment_variable {
+      name  = "DOMAIN_NAME"
+      value = var.domain_name
+    }
+
+    environment_variable {
+      name  = "GITHUB_USERNAME"
+      value = var.github_username
+    }
+
+    environment_variable {
+      name  = "GITHUB_TOKEN"
+      value = var.github_token
+      type  = "PLAINTEXT"
+    }
+  }
+
+  source {
+    type      = "CODEPIPELINE"
+    buildspec = "buildspec_argocd_bootstrap.yaml"
+  }
+}
+
+resource "aws_codebuild_project" "codebuild_project_argocd_uninstall" {
+  name         = "${local.full_project_name}-argocd-uninstall"
+  service_role = aws_iam_role.codebuild_role.arn
+
+  artifacts {
+    type = "CODEPIPELINE"
+  }
+
+  environment {
+    compute_type    = "BUILD_GENERAL1_SMALL"
+    image           = "aws/codebuild/standard:5.0"
+    type            = "LINUX_CONTAINER"
+    privileged_mode = false
+
+    environment_variable {
+      name  = "USE_EKS"
+      value = var.use_eks ? "true" : "false"
+    }
+
+    environment_variable {
+      name  = "EKS_CLUSTER_NAME"
+      value = "${var.project_name}-${var.environment}-eks"
+    }
+
+    environment_variable {
+      name  = "PROJECT_NAME"
+      value = var.project_name
+    }
+
+    environment_variable {
+      name  = "ENVIRONMENT"
+      value = var.environment
+    }
+
+    environment_variable {
+      name  = "AWS_ACCOUNT_ID"
+      value = data.aws_caller_identity.current.account_id
+    }
+
+    environment_variable {
+      name  = "AWS_REGION"
+      value = var.region
+    }
+  }
+
+  source {
+    type      = "CODEPIPELINE"
+    buildspec = "buildspec_argocd_uninstall.yaml"
+  }
+}
+resource "aws_codepipeline" "apply_pipeline" {
+  name     = "${local.full_project_name}-pipeline"
+  role_arn = aws_iam_role.codebuild_role.arn
+
+  artifact_store {
+    location = aws_s3_bucket.pipeline_artifact.bucket
+    type     = "S3"
+  }
+
+  stage {
+    name = "Source"
+
+    action {
+      name             = "Source"
+      category         = "Source"
+      owner            = "AWS"
+      provider         = "CodeStarSourceConnection"
+      version          = "1"
+      output_artifacts = ["source_output"]
+
+      configuration = {
+        ConnectionArn    = aws_codestarconnections_connection.github.arn
+        FullRepositoryId = "${var.github_username}/${local.full_project_name}"
+        BranchName       = "main"
+      }
+    }
+
+    action {
+      name             = "Helm_Source"
+      category         = "Source"
+      owner            = "AWS"
+      provider         = "CodeStarSourceConnection"
+      version          = "1"
+      output_artifacts = ["helm_output"]
+
+      configuration = {
+        ConnectionArn    = aws_codestarconnections_connection.github.arn
+        FullRepositoryId = "${var.github_username}/${var.project_name}-helm"
+        BranchName       = "main"
+      }
+    }
+  }
+
+  stage {
+    name = "Plan"
+
+    action {
+      name             = "TF_Plan"
+      category         = "Build"
+      owner            = "AWS"
+      provider         = "CodeBuild"
+      input_artifacts  = ["source_output"]
+      output_artifacts = ["tf_plan_output"]
+      version          = "1"
+
+      configuration = {
+        ProjectName = "${local.full_project_name}-plan"
+      }
+    }
+  }
+
+  stage {
+    name = "Approval"
+
+    action {
+      name     = "Manual_Approval"
+      category = "Approval"
+      owner    = "AWS"
+      provider = "Manual"
+      version  = "1"
+    }
+  }
+
+  stage {
+    name = "Apply"
+
+    action {
+      name             = "TF_Apply"
+      category         = "Build"
+      owner            = "AWS"
+      provider         = "CodeBuild"
+      input_artifacts  = ["source_output", "tf_plan_output"]
+      output_artifacts = ["tf_apply_output"]
+      version          = "1"
+
+      configuration = {
+        ProjectName   = "${local.full_project_name}-apply"
+        PrimarySource = "source_output"
+      }
+    }
+  }
+
+  stage {
+    name = "ArgoCD_Bootstrap"
+
+    action {
+      name            = "ArgoCD_Bootstrap"
+      category        = "Build"
+      owner           = "AWS"
+      provider        = "CodeBuild"
+      input_artifacts = ["tf_apply_output", "helm_output"]
+      version         = "1"
+
+      configuration = {
+        ProjectName   = "${local.full_project_name}-argocd-bootstrap"
+        PrimarySource = "helm_output"
+      }
+    }
+  }
+}
+
+resource "aws_codepipeline" "destroy_pipeline" {
+  name     = "${local.full_project_name}-destroy-pipeline"
+  role_arn = aws_iam_role.codebuild_role.arn
+
+  artifact_store {
+    location = aws_s3_bucket.pipeline_artifact.bucket
+    type     = "S3"
+  }
+
+  stage {
+    name = "Source"
+
+    action {
+      name             = "Source"
+      category         = "Source"
+      owner            = "AWS"
+      provider         = "CodeStarSourceConnection"
+      version          = "1"
+      output_artifacts = ["source_output"]
+
+      configuration = {
+        ConnectionArn    = aws_codestarconnections_connection.github.arn
+        FullRepositoryId = "${var.github_username}/${local.full_project_name}"
+        BranchName       = "main"
+      }
+    }
+
+    action {
+      name             = "Helm_Source"
+      category         = "Source"
+      owner            = "AWS"
+      provider         = "CodeStarSourceConnection"
+      version          = "1"
+      output_artifacts = ["helm_output"]
+
+      configuration = {
+        ConnectionArn    = aws_codestarconnections_connection.github.arn
+        FullRepositoryId = "${var.github_username}/${var.project_name}-helm"
+        BranchName       = "main"
+      }
+    }
+  }
+
+  stage {
+    name = "Approval"
+
+    action {
+      name     = "Manual_Approval"
+      category = "Approval"
+      owner    = "AWS"
+      provider = "Manual"
+      version  = "1"
+    }
+  }
+
+  stage {
+    name = "ArgoCD_Uninstall"
+
+    action {
+      name            = "ArgoCD_Uninstall"
+      category        = "Build"
+      owner           = "AWS"
+      provider        = "CodeBuild"
+      input_artifacts = ["helm_output"]
+      version         = "1"
+
+      configuration = {
+        ProjectName = "${local.full_project_name}-argocd-uninstall"
+      }
+    }
+  }
+
+  stage {
+    name = "Destroy"
+
+    action {
+      name            = "TF_Destroy"
+      category        = "Build"
+      owner           = "AWS"
+      provider        = "CodeBuild"
+      input_artifacts = ["source_output"]
+      version         = "1"
+
+      configuration = {
+        ProjectName = "${local.full_project_name}-destroy"
+      }
+    }
+  }
+}
+
+resource "aws_codepipeline" "serverless_apply_pipeline" {
+  name     = "${local.serverless_full_project_name}-pipeline"
+  role_arn = aws_iam_role.codebuild_role.arn
+
+  artifact_store {
+    location = aws_s3_bucket.pipeline_artifact.bucket
+    type     = "S3"
+  }
+
+  stage {
+    name = "Source"
+
+    action {
+      name             = "Source"
+      category         = "Source"
+      owner            = "AWS"
+      provider         = "CodeStarSourceConnection"
+      version          = "1"
+      output_artifacts = ["source_output"]
+
+      configuration = {
+        ConnectionArn    = aws_codestarconnections_connection.github.arn
+        FullRepositoryId = "${var.github_username}/${local.serverless_full_project_name}"
+        BranchName       = "main"
+      }
+    }
+  }
+
+  stage {
+    name = "Plan"
+
+    action {
+      name             = "TF_Plan"
+      category         = "Build"
+      owner            = "AWS"
+      provider         = "CodeBuild"
+      input_artifacts  = ["source_output"]
+      output_artifacts = ["tf_plan_output"]
+      version          = "1"
+
+      configuration = {
+        ProjectName = "${local.serverless_full_project_name}-plan"
+      }
+    }
+  }
+
+  stage {
+    name = "Approval"
+
+    action {
+      name     = "Manual_Approval"
+      category = "Approval"
+      owner    = "AWS"
+      provider = "Manual"
+      version  = "1"
+    }
+  }
+
+  stage {
+    name = "Apply"
+
+    action {
+      name             = "TF_Apply"
+      category         = "Build"
+      owner            = "AWS"
+      provider         = "CodeBuild"
+      input_artifacts  = ["source_output", "tf_plan_output"]
+      output_artifacts = ["tf_apply_output"]
+      version          = "1"
+
+      configuration = {
+        ProjectName   = "${local.serverless_full_project_name}-apply"
+        PrimarySource = "source_output"
+      }
+    }
+  }
+}
+
+resource "aws_codepipeline" "serverless_destroy_pipeline" {
+  name     = "${local.serverless_full_project_name}-destroy-pipeline"
+  role_arn = aws_iam_role.codebuild_role.arn
+
+  artifact_store {
+    location = aws_s3_bucket.pipeline_artifact.bucket
+    type     = "S3"
+  }
+
+  stage {
+    name = "Source"
+
+    action {
+      name             = "Source"
+      category         = "Source"
+      owner            = "AWS"
+      provider         = "CodeStarSourceConnection"
+      version          = "1"
+      output_artifacts = ["source_output"]
+
+      configuration = {
+        ConnectionArn    = aws_codestarconnections_connection.github.arn
+        FullRepositoryId = "${var.github_username}/${local.serverless_full_project_name}"
+        BranchName       = "main"
+      }
+    }
+  }
+
+  stage {
+    name = "Approval"
+
+    action {
+      name     = "Manual_Approval"
+      category = "Approval"
+      owner    = "AWS"
+      provider = "Manual"
+      version  = "1"
+    }
+  }
+
+  stage {
+    name = "Destroy"
+
+    action {
+      name            = "TF_Destroy"
+      category        = "Build"
+      owner           = "AWS"
+      provider        = "CodeBuild"
+      input_artifacts = ["source_output"]
+      version         = "1"
+
+      configuration = {
+        ProjectName = "${local.serverless_full_project_name}-destroy"
+      }
+    }
+  }
+}
